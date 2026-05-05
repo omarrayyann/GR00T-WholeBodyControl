@@ -17,19 +17,17 @@ Same as run_g1_control_loop.py, plus a Flask thread on port 5055 that exposes:
 
 Bind address defaults to 0.0.0.0 so the Mac on the LAN can reach it.
 
-RGB sources (in priority order):
-  1. ROS sensor_msgs/Image topic. Default '/camera/color/image_raw'.
-     Override with env var G1_RGB_TOPIC. Comma-separate to subscribe to multiple
-     (then /rgb?camera=<name> selects one; name is the topic without leading '/').
-  2. The sim env's offscreen-rendered cameras (only present if the sim was
-     started with image rendering — the basic --interface sim does not).
+RGB source: JPEG-over-TCP from a gst-launch tcpserversink running on the G1.
+  Default 192.168.123.164:5000. Override:
+      G1_CAMERA_HOST=...   (set empty to disable the latch)
+      G1_CAMERA_PORT=...
 """
 from copy import deepcopy
 import os
+import socket
 import threading
 import time
 
-import cv2
 from flask import Flask, Response, jsonify, request
 import numpy as np
 import tyro
@@ -67,99 +65,96 @@ from decoupled_wbc.control.utils.telemetry import Telemetry
 CONTROL_NODE_NAME = "ControlPolicyServer"
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 5055
-DEFAULT_RGB_TOPIC = "/camera/color/image_raw"
+DEFAULT_CAMERA_HOST = "192.168.123.164"
+DEFAULT_CAMERA_PORT = 5000
+JPEG_SOI = b"\xff\xd8"
+JPEG_EOI = b"\xff\xd9"
 
 
-class RosImageLatch:
-    """Subscribes to one or more sensor_msgs/Image topics and latches the
-    most recent BGR frame from each. Frame name is the topic with the
-    leading '/' stripped (e.g. 'camera/color/image_raw')."""
+class JpegTcpLatch:
+    """Background thread that maintains a TCP connection to a gst-launch
+    tcpserversink (or any source emitting concatenated JPEGs) and latches
+    the most recent complete JPEG. Auto-reconnects if the link drops."""
 
-    def __init__(self, ros_node, topics):
-        from sensor_msgs.msg import Image
-        from decoupled_wbc.control.utils.cv_bridge import CvBridge
+    def __init__(self, host: str, port: int, name: str = "g1_camera"):
+        self.host = host
+        self.port = port
+        self.name = name
         self._lock = threading.Lock()
-        self._frames = {}  # name -> (bgr_ndarray, timestamp_sec)
-        self._bridge = CvBridge()
-        self._subs = []
-        for topic in topics:
-            name = topic.lstrip("/")
+        self._jpeg = None
+        self._timestamp = 0.0
+        self._connected = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name=f"jpeg-latch-{name}")
+        self._thread.start()
 
-            def make_cb(n):
-                def cb(msg):
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                sock = socket.create_connection((self.host, self.port), timeout=5)
+                sock.setblocking(False)
+                self._connected = True
+                print(f"[server] camera latch connected to {self.host}:{self.port}")
+                buf = b""
+                while not self._stop.is_set():
                     try:
-                        img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-                    except Exception as e:
-                        print(f"[server] cv_bridge failed for {n}: {e}")
-                        return
-                    ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-                    with self._lock:
-                        self._frames[n] = (img, ts)
-                return cb
+                        chunk = sock.recv(1 << 20)
+                    except BlockingIOError:
+                        time.sleep(0.005)
+                        continue
+                    if not chunk:
+                        break
+                    buf += chunk
+                    last_eoi = buf.rfind(JPEG_EOI)
+                    if last_eoi >= 0:
+                        last_soi = buf.rfind(JPEG_SOI, 0, last_eoi)
+                        if last_soi >= 0:
+                            jpeg = buf[last_soi : last_eoi + 2]
+                            buf = buf[last_eoi + 2 :]
+                            with self._lock:
+                                self._jpeg = jpeg
+                                self._timestamp = time.time()
+                    if len(buf) > 5_000_000:
+                        buf = buf[-1_000_000:]
+                sock.close()
+                self._connected = False
+            except (OSError, socket.timeout) as e:
+                self._connected = False
+                if not self._stop.is_set():
+                    print(f"[server] camera latch reconnect in 2s ({e})")
+                    self._stop.wait(2.0)
 
-            sub = ros_node.create_subscription(Image, topic, make_cb(name), 1)
-            self._subs.append(sub)
-            print(f"[server] subscribed to RGB topic: {topic}")
-
-    def get(self, name=None):
+    def get_jpeg(self):
         with self._lock:
-            if not self._frames:
-                return None, None, None
-            if name is None:
-                name = next(iter(self._frames))
-            entry = self._frames.get(name)
-            if entry is None:
-                return None, None, None
-            img, ts = entry
-            return name, img, ts
+            return self._jpeg, self._timestamp
 
-    def list_names(self):
-        with self._lock:
-            return list(self._frames.keys())
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def stop(self):
+        self._stop.set()
 
 
 class LatestSnapshot:
-    """Thread-safe holder for the most recent observation (split into JSON + images)."""
+    """Thread-safe holder for the most recent observation as JSON-able dict.
+    Image fields (anything ending in '_image') are stripped — RGB comes
+    from the camera latch, not the obs."""
+
     def __init__(self):
         self._lock = threading.Lock()
         self._json = None
-        self._images = {}  # camera_name -> latest np.ndarray (HxWx3 uint8 RGB)
 
     def set(self, obs):
-        json_data = {}
-        images = {}
-        for k, v in obs.items():
-            if isinstance(k, str) and k.endswith("_image"):
-                # strip "_image" suffix to get the camera name
-                images[k[: -len("_image")]] = v
-            elif hasattr(v, "tolist"):
-                json_data[k] = v.tolist()
-            elif isinstance(v, dict):
-                json_data[k] = _nested_jsonable(v)
-            elif isinstance(v, (list, tuple)):
-                json_data[k] = [x.tolist() if hasattr(x, "tolist") else x for x in v]
-            else:
-                json_data[k] = v
         with self._lock:
-            self._json = json_data
-            self._images = images
+            self._json = _nested_jsonable(
+                {k: v for k, v in obs.items()
+                 if not (isinstance(k, str) and k.endswith("_image"))}
+            )
 
     def get_json(self):
         with self._lock:
             return self._json
-
-    def get_image(self, camera=None):
-        with self._lock:
-            if not self._images:
-                return None, None
-            if camera is None:
-                camera = next(iter(self._images))
-            img = self._images.get(camera)
-            return camera, img
-
-    def list_cameras(self):
-        with self._lock:
-            return list(self._images.keys())
 
 
 def _nested_jsonable(d):
@@ -169,12 +164,14 @@ def _nested_jsonable(d):
             out[k] = v.tolist()
         elif isinstance(v, dict):
             out[k] = _nested_jsonable(v)
+        elif isinstance(v, (list, tuple)):
+            out[k] = [x.tolist() if hasattr(x, "tolist") else x for x in v]
         else:
             out[k] = v
     return out
 
 
-def build_flask_app(wbc_policy, latest):
+def build_flask_app(wbc_policy, latest, camera):
     app = Flask(__name__)
 
     def lower():
@@ -283,28 +280,31 @@ def build_flask_app(wbc_policy, latest):
 
     @app.get("/cameras")
     def get_cameras():
-        return jsonify(cameras=latest.list_cameras())
+        if camera is None:
+            return jsonify(cameras=[])
+        return jsonify(cameras=[camera.name],
+                       connected=camera.is_connected(),
+                       source=f"{camera.host}:{camera.port}")
 
     @app.get("/rgb")
     def get_rgb():
-        camera = request.args.get("camera")
-        name, img = latest.get_image(camera)
-        if img is None:
+        if camera is None:
+            return jsonify(error="camera latch disabled (set G1_CAMERA_HOST)"), 503
+        jpeg, ts = camera.get_jpeg()
+        if jpeg is None:
             return jsonify(
-                error="no image available",
-                hint="run sim with --enable-offscreen / --image-publish, "
-                     "or start the camera forwarder for real robot",
-                cameras=latest.list_cameras(),
+                error="no image yet",
+                connected=camera.is_connected(),
+                source=f"{camera.host}:{camera.port}",
+                hint="is the gst-launch tcpserversink running on the G1?",
             ), 503
-        # obs images are RGB; cv2 expects BGR for JPEG encoding
-        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if not ok:
-            return jsonify(error="jpeg encode failed"), 500
         return Response(
-            buf.tobytes(),
+            jpeg,
             mimetype="image/jpeg",
-            headers={"X-Camera-Name": name},
+            headers={
+                "X-Camera-Name": camera.name,
+                "X-Frame-Timestamp": f"{ts:.6f}",
+            },
         )
 
     return app
@@ -324,8 +324,8 @@ def _state(p):
     }
 
 
-def start_flask_thread(wbc_policy, latest):
-    app = build_flask_app(wbc_policy, latest)
+def start_flask_thread(wbc_policy, latest, camera):
+    app = build_flask_app(wbc_policy, latest, camera)
     t = threading.Thread(
         target=lambda: app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True, use_reloader=False),
         daemon=True,
@@ -334,6 +334,15 @@ def start_flask_thread(wbc_policy, latest):
     t.start()
     print(f"[server] HTTP command server listening on {SERVER_HOST}:{SERVER_PORT}")
     return t
+
+
+def start_camera_latch():
+    host = os.environ.get("G1_CAMERA_HOST", DEFAULT_CAMERA_HOST)
+    if not host:
+        print("[server] camera latch disabled (G1_CAMERA_HOST is empty)")
+        return None
+    port = int(os.environ.get("G1_CAMERA_PORT", DEFAULT_CAMERA_PORT))
+    return JpegTcpLatch(host=host, port=port, name="g1_camera")
 
 
 def main(config: ControlLoopConfig):
@@ -383,7 +392,8 @@ def main(config: ControlLoopConfig):
     dispatcher.start()
 
     latest = LatestSnapshot()
-    start_flask_thread(wbc_policy, latest)
+    camera = start_camera_latch()
+    start_flask_thread(wbc_policy, latest, camera)
 
     rate = node.create_rate(config.control_frequency)
 
