@@ -17,10 +17,10 @@ Same as run_g1_control_loop.py, plus a Flask thread on port 5055 that exposes:
 
 Bind address defaults to 0.0.0.0 so the Mac on the LAN can reach it.
 
-RGB source: JPEG-over-TCP from a gst-launch tcpserversink running on the G1.
-  Default 192.168.123.164:5000. Override:
-      G1_CAMERA_HOST=...   (set empty to disable the latch)
-      G1_CAMERA_PORT=...
+RGB sources: one or more JPEG-over-TCP streams from gst-launch tcpserversinks.
+  Default: 'cam1:192.168.123.164:5000,cam2:192.168.123.164:5001'.
+  Override with env var G1_CAMERAS (comma-separated 'name:host:port' triples).
+  Set G1_CAMERAS empty to disable.
 """
 from copy import deepcopy
 import os
@@ -65,8 +65,7 @@ from decoupled_wbc.control.utils.telemetry import Telemetry
 CONTROL_NODE_NAME = "ControlPolicyServer"
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 5055
-DEFAULT_CAMERA_HOST = "192.168.123.164"
-DEFAULT_CAMERA_PORT = 5000
+DEFAULT_CAMERAS = "head_camera:192.168.123.164:5000,face_camera:192.168.123.164:5001"
 JPEG_SOI = b"\xff\xd8"
 JPEG_EOI = b"\xff\xd9"
 
@@ -171,7 +170,8 @@ def _nested_jsonable(d):
     return out
 
 
-def build_flask_app(wbc_policy, latest, camera):
+def build_flask_app(wbc_policy, latest, cameras):
+    """`cameras` is a dict {name: JpegTcpLatch}. Empty dict means RGB disabled."""
     app = Flask(__name__)
 
     def lower():
@@ -280,29 +280,43 @@ def build_flask_app(wbc_policy, latest, camera):
 
     @app.get("/cameras")
     def get_cameras():
-        if camera is None:
-            return jsonify(cameras=[])
-        return jsonify(cameras=[camera.name],
-                       connected=camera.is_connected(),
-                       source=f"{camera.host}:{camera.port}")
+        return jsonify(cameras=[
+            {
+                "name": cam.name,
+                "source": f"{cam.host}:{cam.port}",
+                "connected": cam.is_connected(),
+            }
+            for cam in cameras.values()
+        ])
 
     @app.get("/rgb")
     def get_rgb():
-        if camera is None:
-            return jsonify(error="camera latch disabled (set G1_CAMERA_HOST)"), 503
-        jpeg, ts = camera.get_jpeg()
+        if not cameras:
+            return jsonify(error="no cameras configured (set G1_CAMERAS)"), 503
+        name = request.args.get("camera")
+        if name is None:
+            cam = next(iter(cameras.values()))
+        else:
+            cam = cameras.get(name)
+            if cam is None:
+                return jsonify(
+                    error=f"unknown camera {name!r}",
+                    available=list(cameras.keys()),
+                ), 404
+        jpeg, ts = cam.get_jpeg()
         if jpeg is None:
             return jsonify(
                 error="no image yet",
-                connected=camera.is_connected(),
-                source=f"{camera.host}:{camera.port}",
+                camera=cam.name,
+                connected=cam.is_connected(),
+                source=f"{cam.host}:{cam.port}",
                 hint="is the gst-launch tcpserversink running on the G1?",
             ), 503
         return Response(
             jpeg,
             mimetype="image/jpeg",
             headers={
-                "X-Camera-Name": camera.name,
+                "X-Camera-Name": cam.name,
                 "X-Frame-Timestamp": f"{ts:.6f}",
             },
         )
@@ -324,8 +338,8 @@ def _state(p):
     }
 
 
-def start_flask_thread(wbc_policy, latest, camera):
-    app = build_flask_app(wbc_policy, latest, camera)
+def start_flask_thread(wbc_policy, latest, cameras):
+    app = build_flask_app(wbc_policy, latest, cameras)
     t = threading.Thread(
         target=lambda: app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True, use_reloader=False),
         daemon=True,
@@ -336,13 +350,26 @@ def start_flask_thread(wbc_policy, latest, camera):
     return t
 
 
-def start_camera_latch():
-    host = os.environ.get("G1_CAMERA_HOST", DEFAULT_CAMERA_HOST)
-    if not host:
-        print("[server] camera latch disabled (G1_CAMERA_HOST is empty)")
-        return None
-    port = int(os.environ.get("G1_CAMERA_PORT", DEFAULT_CAMERA_PORT))
-    return JpegTcpLatch(host=host, port=port, name="g1_camera")
+def start_camera_latches():
+    """Parse G1_CAMERAS env var ('name:host:port,...') and start one
+    JpegTcpLatch per entry. Returns a dict {name: JpegTcpLatch}."""
+    spec = os.environ.get("G1_CAMERAS", DEFAULT_CAMERAS).strip()
+    if not spec:
+        print("[server] camera latches disabled (G1_CAMERAS is empty)")
+        return {}
+    cameras = {}
+    for entry in spec.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            name, host, port = entry.split(":")
+            port = int(port)
+        except ValueError:
+            print(f"[server] skipping malformed G1_CAMERAS entry: {entry!r}")
+            continue
+        cameras[name] = JpegTcpLatch(host=host, port=port, name=name)
+    return cameras
 
 
 def main(config: ControlLoopConfig):
@@ -392,8 +419,8 @@ def main(config: ControlLoopConfig):
     dispatcher.start()
 
     latest = LatestSnapshot()
-    camera = start_camera_latch()
-    start_flask_thread(wbc_policy, latest, camera)
+    cameras = start_camera_latches()
+    start_flask_thread(wbc_policy, latest, cameras)
 
     rate = node.create_rate(config.control_frequency)
 
