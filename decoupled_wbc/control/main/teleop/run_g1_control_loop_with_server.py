@@ -14,13 +14,23 @@ Same as run_g1_control_loop.py, plus a Flask thread on port 5055 that exposes:
                     [, "duration": seconds]      -> command upper-body joint targets
   GET  /cameras                        -> list of available camera/topic names
   GET  /rgb[?camera=<name>]            -> latest RGB frame as JPEG bytes
+  GET  /gripper                        -> latest dex1 gripper state(s)
+  POST /gripper {"side":"right|left|both", "q": <rad>}      OR
+                {"right": <rad>, "left": <rad>}            -> command gripper(s)
 
 Bind address defaults to 0.0.0.0 so the Mac on the LAN can reach it.
 
-RGB sources: one or more JPEG-over-TCP streams from gst-launch tcpserversinks.
-  Default: 'cam1:192.168.123.164:5000,cam2:192.168.123.164:5001'.
-  Override with env var G1_CAMERAS (comma-separated 'name:host:port' triples).
-  Set G1_CAMERAS empty to disable.
+RGB source: JPEG-over-TCP from a gst-launch tcpserversink running on the G1.
+  Default 192.168.123.164:5000. Override:
+      G1_CAMERA_HOST=...   (set empty to disable the latch)
+      G1_CAMERA_PORT=...
+
+Dex1 gripper:
+  Talks to dex1_1_gripper_server over Unitree DDS topics
+  rt/dex1/{right,left}/{cmd,state}. Configure with:
+      G1_GRIPPER=0        disable
+      G1_GRIPPER_IFACE=enp4s0   network interface for the unitree channel factory
+      G1_GRIPPER_SIDES=right,left  which sides to subscribe / publish
 """
 from copy import deepcopy
 import os
@@ -65,9 +75,13 @@ from decoupled_wbc.control.utils.telemetry import Telemetry
 CONTROL_NODE_NAME = "ControlPolicyServer"
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 5055
-DEFAULT_CAMERAS = "head_camera:192.168.123.164:5000,face_camera:192.168.123.164:5001"
+DEFAULT_CAMERA_HOST = "192.168.123.164"
+DEFAULT_CAMERA_PORT = 5000
 JPEG_SOI = b"\xff\xd8"
 JPEG_EOI = b"\xff\xd9"
+DEX1_KP = 5.0
+DEX1_KD = 0.05
+DEFAULT_GRIPPER_IFACE = "enp4s0"
 
 
 class JpegTcpLatch:
@@ -135,6 +149,76 @@ class JpegTcpLatch:
         self._stop.set()
 
 
+class Dex1Latch:
+    """Subscribes to rt/dex1/{side}/state for state readback and publishes
+    to rt/dex1/{side}/cmd for commands. Talks to dex1_1_gripper_server on
+    the G1 via Unitree's DDS channel."""
+
+    def __init__(self, sides=("right", "left"), iface=DEFAULT_GRIPPER_IFACE,
+                 kp=DEX1_KP, kd=DEX1_KD):
+        from unitree_sdk2py.core.channel import (
+            ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber,
+        )
+        from unitree_sdk2py.idl.unitree_go.msg.dds_ import (
+            MotorCmd_, MotorCmds_, MotorStates_,
+        )
+        try:
+            ChannelFactoryInitialize(0, iface)
+        except Exception as e:
+            # already initialized by env in --interface real, that's fine
+            print(f"[server][dex1] ChannelFactoryInitialize note: {e}")
+
+        self._MotorCmd_ = MotorCmd_
+        self._MotorCmds_ = MotorCmds_
+        self._kp = float(kp)
+        self._kd = float(kd)
+        self._lock = threading.Lock()
+        self._states = {}        # side -> {q, dq, tau, ts}
+        self._pubs = {}          # side -> ChannelPublisher
+        self._subs = []
+        self.sides = list(sides)
+
+        for side in self.sides:
+            sub = ChannelSubscriber(f"rt/dex1/{side}/state", MotorStates_)
+            sub.Init(handler=self._make_state_cb(side), queueLen=1)
+            self._subs.append(sub)
+            pub = ChannelPublisher(f"rt/dex1/{side}/cmd", MotorCmds_)
+            pub.Init()
+            self._pubs[side] = pub
+            print(f"[server][dex1] sub rt/dex1/{side}/state, pub rt/dex1/{side}/cmd")
+
+    def _make_state_cb(self, side):
+        def cb(msg):
+            if not msg.states:
+                return
+            s = msg.states[0]
+            with self._lock:
+                self._states[side] = {
+                    "q": float(s.q),
+                    "dq": float(s.dq),
+                    "tau": float(s.tau_est),
+                    "ts": time.time(),
+                }
+        return cb
+
+    def get_states(self):
+        with self._lock:
+            return {k: dict(v) for k, v in self._states.items()}
+
+    def set_position(self, side: str, q: float,
+                     kp: float | None = None, kd: float | None = None):
+        if side not in self._pubs:
+            raise ValueError(f"unknown side: {side!r} (have {list(self._pubs)})")
+        cmd = self._MotorCmds_()
+        cmd.cmds = [self._MotorCmd_(
+            mode=1, q=float(q), dq=0.0, tau=0.0,
+            kp=float(self._kp if kp is None else kp),
+            kd=float(self._kd if kd is None else kd),
+            reserve=[0, 0, 0],
+        )]
+        self._pubs[side].Write(cmd)
+
+
 class LatestSnapshot:
     """Thread-safe holder for the most recent observation as JSON-able dict.
     Image fields (anything ending in '_image') are stripped — RGB comes
@@ -170,8 +254,7 @@ def _nested_jsonable(d):
     return out
 
 
-def build_flask_app(wbc_policy, latest, cameras):
-    """`cameras` is a dict {name: JpegTcpLatch}. Empty dict means RGB disabled."""
+def build_flask_app(wbc_policy, latest, camera, dex1):
     app = Flask(__name__)
 
     def lower():
@@ -280,46 +363,72 @@ def build_flask_app(wbc_policy, latest, cameras):
 
     @app.get("/cameras")
     def get_cameras():
-        return jsonify(cameras=[
-            {
-                "name": cam.name,
-                "source": f"{cam.host}:{cam.port}",
-                "connected": cam.is_connected(),
-            }
-            for cam in cameras.values()
-        ])
+        if camera is None:
+            return jsonify(cameras=[])
+        return jsonify(cameras=[camera.name],
+                       connected=camera.is_connected(),
+                       source=f"{camera.host}:{camera.port}")
 
     @app.get("/rgb")
     def get_rgb():
-        if not cameras:
-            return jsonify(error="no cameras configured (set G1_CAMERAS)"), 503
-        name = request.args.get("camera")
-        if name is None:
-            cam = next(iter(cameras.values()))
-        else:
-            cam = cameras.get(name)
-            if cam is None:
-                return jsonify(
-                    error=f"unknown camera {name!r}",
-                    available=list(cameras.keys()),
-                ), 404
-        jpeg, ts = cam.get_jpeg()
+        if camera is None:
+            return jsonify(error="camera latch disabled (set G1_CAMERA_HOST)"), 503
+        jpeg, ts = camera.get_jpeg()
         if jpeg is None:
             return jsonify(
                 error="no image yet",
-                camera=cam.name,
-                connected=cam.is_connected(),
-                source=f"{cam.host}:{cam.port}",
+                connected=camera.is_connected(),
+                source=f"{camera.host}:{camera.port}",
                 hint="is the gst-launch tcpserversink running on the G1?",
             ), 503
         return Response(
             jpeg,
             mimetype="image/jpeg",
             headers={
-                "X-Camera-Name": cam.name,
+                "X-Camera-Name": camera.name,
                 "X-Frame-Timestamp": f"{ts:.6f}",
             },
         )
+
+    @app.get("/gripper")
+    def get_gripper():
+        if dex1 is None:
+            return jsonify(error="gripper disabled (set G1_GRIPPER=1 to enable)"), 503
+        states = dex1.get_states()
+        if not states:
+            return jsonify(
+                error="no gripper state yet",
+                hint="is dex1_1_gripper_server running on the G1?",
+                sides_subscribed=dex1.sides,
+            ), 503
+        return jsonify(states)
+
+    @app.post("/gripper")
+    def post_gripper():
+        if dex1 is None:
+            return jsonify(error="gripper disabled (set G1_GRIPPER=1 to enable)"), 503
+        body = request.get_json(force=True) or {}
+        applied = {}
+        try:
+            if "side" in body and "q" in body:
+                side = body["side"]
+                q = float(body["q"])
+                targets = dex1.sides if side == "both" else [side]
+                for s in targets:
+                    dex1.set_position(s, q)
+                    applied[s] = q
+            else:
+                for s in ("right", "left"):
+                    if s in body:
+                        dex1.set_position(s, float(body[s]))
+                        applied[s] = float(body[s])
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        if not applied:
+            return jsonify(
+                error="provide {'side':'right|left|both','q':<rad>} or {'right':<rad>,'left':<rad>}",
+            ), 400
+        return jsonify(ok=True, applied=applied)
 
     return app
 
@@ -338,8 +447,8 @@ def _state(p):
     }
 
 
-def start_flask_thread(wbc_policy, latest, cameras):
-    app = build_flask_app(wbc_policy, latest, cameras)
+def start_flask_thread(wbc_policy, latest, camera, dex1):
+    app = build_flask_app(wbc_policy, latest, camera, dex1)
     t = threading.Thread(
         target=lambda: app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True, use_reloader=False),
         daemon=True,
@@ -350,26 +459,28 @@ def start_flask_thread(wbc_policy, latest, cameras):
     return t
 
 
-def start_camera_latches():
-    """Parse G1_CAMERAS env var ('name:host:port,...') and start one
-    JpegTcpLatch per entry. Returns a dict {name: JpegTcpLatch}."""
-    spec = os.environ.get("G1_CAMERAS", DEFAULT_CAMERAS).strip()
-    if not spec:
-        print("[server] camera latches disabled (G1_CAMERAS is empty)")
-        return {}
-    cameras = {}
-    for entry in spec.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        try:
-            name, host, port = entry.split(":")
-            port = int(port)
-        except ValueError:
-            print(f"[server] skipping malformed G1_CAMERAS entry: {entry!r}")
-            continue
-        cameras[name] = JpegTcpLatch(host=host, port=port, name=name)
-    return cameras
+def start_camera_latch():
+    host = os.environ.get("G1_CAMERA_HOST", DEFAULT_CAMERA_HOST)
+    if not host:
+        print("[server] camera latch disabled (G1_CAMERA_HOST is empty)")
+        return None
+    port = int(os.environ.get("G1_CAMERA_PORT", DEFAULT_CAMERA_PORT))
+    return JpegTcpLatch(host=host, port=port, name="g1_camera")
+
+
+def start_dex1_latch():
+    if os.environ.get("G1_GRIPPER", "1") in ("0", "false", "False", ""):
+        print("[server] dex1 gripper latch disabled (G1_GRIPPER=0)")
+        return None
+    iface = os.environ.get("G1_GRIPPER_IFACE", DEFAULT_GRIPPER_IFACE)
+    sides = [s.strip() for s in
+             os.environ.get("G1_GRIPPER_SIDES", "right,left").split(",")
+             if s.strip()]
+    try:
+        return Dex1Latch(sides=tuple(sides), iface=iface)
+    except Exception as e:
+        print(f"[server][dex1] failed to start latch: {e}")
+        return None
 
 
 def main(config: ControlLoopConfig):
@@ -419,8 +530,9 @@ def main(config: ControlLoopConfig):
     dispatcher.start()
 
     latest = LatestSnapshot()
-    cameras = start_camera_latches()
-    start_flask_thread(wbc_policy, latest, cameras)
+    camera = start_camera_latch()
+    dex1 = start_dex1_latch()
+    start_flask_thread(wbc_policy, latest, camera, dex1)
 
     rate = node.create_rate(config.control_frequency)
 
