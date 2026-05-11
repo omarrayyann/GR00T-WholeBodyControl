@@ -14,6 +14,8 @@ Same as run_g1_control_loop.py, plus a Flask thread on port 5055 that exposes:
                     [, "duration": seconds]      -> command upper-body joint targets
   GET  /cameras                        -> list of available camera/topic names
   GET  /rgb[?camera=<name>]            -> latest RGB frame as JPEG bytes
+  GET  /stream.mjpg                    -> persistent multipart MJPEG stream
+                                          (low-latency live video; cv2.VideoCapture(url))
   GET  /gripper                        -> latest dex1 gripper state(s)
   POST /gripper {"side":"right|left|both", "q": <rad>}      OR
                 {"right": <rad>, "left": <rad>}            -> command gripper(s)
@@ -388,6 +390,36 @@ def build_flask_app(wbc_policy, latest, camera, dex1):
                 "X-Camera-Name": camera.name,
                 "X-Frame-Timestamp": f"{ts:.6f}",
             },
+        )
+
+    @app.get("/stream.mjpg")
+    def get_stream():
+        """Persistent multipart/x-mixed-replace MJPEG stream.
+        Open with cv2.VideoCapture(url) or any browser tab."""
+        if camera is None:
+            return jsonify(error="camera latch disabled"), 503
+
+        boundary = b"frame"
+
+        def gen():
+            last_sent_ts = 0.0
+            while True:
+                jpeg, ts = camera.get_jpeg()
+                if jpeg is None or ts == last_sent_ts:
+                    time.sleep(0.005)
+                    continue
+                last_sent_ts = ts
+                yield (
+                    b"--" + boundary + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                    + jpeg + b"\r\n"
+                )
+
+        return Response(
+            gen(),
+            mimetype=b"multipart/x-mixed-replace; boundary=" + boundary,
+            headers={"X-Camera-Name": camera.name},
         )
 
     @app.get("/gripper")
