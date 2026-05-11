@@ -89,7 +89,7 @@ class JpegTcpLatch:
     tcpserversink (or any source emitting concatenated JPEGs) and latches
     the most recent complete JPEG. Auto-reconnects if the link drops."""
 
-    def __init__(self, host: str, port: int, name: str = "g1_camera"):
+    def __init__(self, host: str, port: int, name: str = "head_camera"):
         self.host = host
         self.port = port
         self.name = name
@@ -465,7 +465,7 @@ def start_camera_latch():
         print("[server] camera latch disabled (G1_CAMERA_HOST is empty)")
         return None
     port = int(os.environ.get("G1_CAMERA_PORT", DEFAULT_CAMERA_PORT))
-    return JpegTcpLatch(host=host, port=port, name="g1_camera")
+    return JpegTcpLatch(host=host, port=port, name="head_camera")
 
 
 def start_dex1_latch():
