@@ -12,9 +12,9 @@ Same as run_g1_control_loop.py, plus a Flask thread on port 5055 that exposes:
   GET  /upper_body_names               -> upper-body joint names + their indices in obs.q
   POST /upper_body  {"target":[..n..]} OR {"joints":{"name":val,...}}
                     [, "duration": seconds]      -> command upper-body joint targets
-  GET  /cameras                        -> list of available camera/topic names
+  GET  /cameras                        -> list of available cameras + connect state
   GET  /rgb[?camera=<name>]            -> latest RGB frame as JPEG bytes
-  GET  /stream.mjpg                    -> persistent multipart MJPEG stream
+  GET  /stream.mjpg[?camera=<name>]    -> persistent multipart MJPEG stream
                                           (low-latency live video; cv2.VideoCapture(url))
   GET  /gripper                        -> latest dex1 gripper state(s)
   POST /gripper {"side":"right|left|both", "q": <rad>}      OR
@@ -22,10 +22,12 @@ Same as run_g1_control_loop.py, plus a Flask thread on port 5055 that exposes:
 
 Bind address defaults to 0.0.0.0 so the Mac on the LAN can reach it.
 
-RGB source: JPEG-over-TCP from a gst-launch tcpserversink running on the G1.
-  Default 192.168.123.164:5000. Override:
-      G1_CAMERA_HOST=...   (set empty to disable the latch)
-      G1_CAMERA_PORT=...
+RGB sources: JPEG-over-TCP from gst-launch tcpserversink instances on the G1.
+  Configure multiple cameras with:
+      G1_CAMERAS="head_camera@192.168.123.164:5000,wrist_camera@192.168.123.164:5001"
+  Or for a single camera (back-compat):
+      G1_CAMERA_HOST=192.168.123.164  G1_CAMERA_PORT=5000
+  Set G1_CAMERAS="" or G1_CAMERA_HOST="" to disable.
 
 Dex1 gripper:
   Talks to dex1_1_gripper_server over Unitree DDS topics
@@ -256,7 +258,7 @@ def _nested_jsonable(d):
     return out
 
 
-def build_flask_app(wbc_policy, latest, camera, dex1):
+def build_flask_app(wbc_policy, latest, cameras, dex1):
     app = Flask(__name__)
 
     def lower():
@@ -363,31 +365,46 @@ def build_flask_app(wbc_policy, latest, camera, dex1):
             duration=duration,
         )
 
+    def _pick_camera():
+        """Return (name, latch) chosen by ?camera=... query, or the first one."""
+        if not cameras:
+            return None, None
+        name = request.args.get("camera")
+        if name is None:
+            name = next(iter(cameras))
+        return name, cameras.get(name)
+
     @app.get("/cameras")
     def get_cameras():
-        if camera is None:
-            return jsonify(cameras=[])
-        return jsonify(cameras=[camera.name],
-                       connected=camera.is_connected(),
-                       source=f"{camera.host}:{camera.port}")
+        return jsonify(cameras={
+            name: {
+                "connected": cam.is_connected(),
+                "source": f"{cam.host}:{cam.port}",
+            } for name, cam in cameras.items()
+        })
 
     @app.get("/rgb")
     def get_rgb():
-        if camera is None:
-            return jsonify(error="camera latch disabled (set G1_CAMERA_HOST)"), 503
-        jpeg, ts = camera.get_jpeg()
+        if not cameras:
+            return jsonify(error="no cameras configured (set G1_CAMERAS or G1_CAMERA_HOST)"), 503
+        name, cam = _pick_camera()
+        if cam is None:
+            return jsonify(error=f"unknown camera {name!r}",
+                           available=list(cameras)), 404
+        jpeg, ts = cam.get_jpeg()
         if jpeg is None:
             return jsonify(
                 error="no image yet",
-                connected=camera.is_connected(),
-                source=f"{camera.host}:{camera.port}",
+                camera=name,
+                connected=cam.is_connected(),
+                source=f"{cam.host}:{cam.port}",
                 hint="is the gst-launch tcpserversink running on the G1?",
             ), 503
         return Response(
             jpeg,
             mimetype="image/jpeg",
             headers={
-                "X-Camera-Name": camera.name,
+                "X-Camera-Name": name,
                 "X-Frame-Timestamp": f"{ts:.6f}",
             },
         )
@@ -396,15 +413,19 @@ def build_flask_app(wbc_policy, latest, camera, dex1):
     def get_stream():
         """Persistent multipart/x-mixed-replace MJPEG stream.
         Open with cv2.VideoCapture(url) or any browser tab."""
-        if camera is None:
-            return jsonify(error="camera latch disabled"), 503
+        if not cameras:
+            return jsonify(error="no cameras configured"), 503
+        name, cam = _pick_camera()
+        if cam is None:
+            return jsonify(error=f"unknown camera {name!r}",
+                           available=list(cameras)), 404
 
         boundary = b"frame"
 
         def gen():
             last_sent_ts = 0.0
             while True:
-                jpeg, ts = camera.get_jpeg()
+                jpeg, ts = cam.get_jpeg()
                 if jpeg is None or ts == last_sent_ts:
                     time.sleep(0.005)
                     continue
@@ -419,7 +440,7 @@ def build_flask_app(wbc_policy, latest, camera, dex1):
         return Response(
             gen(),
             mimetype=b"multipart/x-mixed-replace; boundary=" + boundary,
-            headers={"X-Camera-Name": camera.name},
+            headers={"X-Camera-Name": name},
         )
 
     @app.get("/gripper")
@@ -479,8 +500,8 @@ def _state(p):
     }
 
 
-def start_flask_thread(wbc_policy, latest, camera, dex1):
-    app = build_flask_app(wbc_policy, latest, camera, dex1)
+def start_flask_thread(wbc_policy, latest, cameras, dex1):
+    app = build_flask_app(wbc_policy, latest, cameras, dex1)
     t = threading.Thread(
         target=lambda: app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True, use_reloader=False),
         daemon=True,
@@ -491,13 +512,45 @@ def start_flask_thread(wbc_policy, latest, camera, dex1):
     return t
 
 
-def start_camera_latch():
-    host = os.environ.get("G1_CAMERA_HOST", DEFAULT_CAMERA_HOST)
-    if not host:
-        print("[server] camera latch disabled (G1_CAMERA_HOST is empty)")
-        return None
-    port = int(os.environ.get("G1_CAMERA_PORT", DEFAULT_CAMERA_PORT))
-    return JpegTcpLatch(host=host, port=port, name="head_camera")
+# default camera roster: head + wrist. Override with G1_CAMERAS env var.
+DEFAULT_CAMERAS = (
+    ("head_camera", "192.168.123.164", 5000),
+    ("wrist_camera", "192.168.123.164", 5001),
+)
+
+
+def start_camera_latches():
+    spec = os.environ.get("G1_CAMERAS")
+    if spec == "":
+        print("[server] cameras disabled (G1_CAMERAS is empty)")
+        return {}
+    entries = []
+    if spec is not None:
+        # parse "name1@host1:port1,name2@host2:port2"
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                name, hostport = part.split("@", 1)
+                host, port = hostport.rsplit(":", 1)
+                entries.append((name, host, int(port)))
+            except ValueError:
+                print(f"[server] bad G1_CAMERAS entry: {part!r}")
+    elif os.environ.get("G1_CAMERA_HOST") == "":
+        # explicit single-camera disable for back-compat
+        return {}
+    elif os.environ.get("G1_CAMERA_HOST") or os.environ.get("G1_CAMERA_PORT"):
+        # back-compat single-camera env vars
+        entries.append((
+            "head_camera",
+            os.environ.get("G1_CAMERA_HOST", DEFAULT_CAMERA_HOST),
+            int(os.environ.get("G1_CAMERA_PORT", DEFAULT_CAMERA_PORT)),
+        ))
+    else:
+        entries = list(DEFAULT_CAMERAS)
+    return {name: JpegTcpLatch(host=host, port=port, name=name)
+            for name, host, port in entries}
 
 
 def start_dex1_latch():
@@ -562,9 +615,9 @@ def main(config: ControlLoopConfig):
     dispatcher.start()
 
     latest = LatestSnapshot()
-    camera = start_camera_latch()
+    cameras = start_camera_latches()
     dex1 = start_dex1_latch()
-    start_flask_thread(wbc_policy, latest, camera, dex1)
+    start_flask_thread(wbc_policy, latest, cameras, dex1)
 
     rate = node.create_rate(config.control_frequency)
 
