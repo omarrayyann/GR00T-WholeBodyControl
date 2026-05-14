@@ -29,6 +29,11 @@ RGB sources: JPEG-over-TCP from gst-launch tcpserversink instances on the G1.
       G1_CAMERA_HOST=192.168.123.164  G1_CAMERA_PORT=5000
   Set G1_CAMERAS="" or G1_CAMERA_HOST="" to disable.
 
+Passive arms (real-robot only — real arms hang limp under gravity):
+      G1_PASSIVE_ARMS=left          # left arm receives kp=kd=0
+      G1_PASSIVE_ARMS=left,right    # both arms passive
+      G1_PASSIVE_ARMS=               # default: both arms actuated
+
 Dex1 gripper:
   Talks to dex1_1_gripper_server over Unitree DDS topics
   rt/dex1/{right,left}/{cmd,state}. Configure with:
@@ -553,6 +558,38 @@ def start_camera_latches():
             for name, host, port in entries}
 
 
+# Body motor index layout (29 actuators):
+#   0..5   left leg
+#   6..11  right leg
+#   12..14 waist
+#   15..21 left arm
+#   22..28 right arm
+PASSIVE_ARM_SLICES = {"left": slice(15, 22), "right": slice(22, 29)}
+
+
+def apply_passive_arms(env):
+    """If G1_PASSIVE_ARMS is set, zero kp/kd of those arm motors so they hang
+    limp (real-robot only; sim has no effect)."""
+    spec = os.environ.get("G1_PASSIVE_ARMS", "")
+    sides = [s.strip().lower() for s in spec.split(",") if s.strip()]
+    if not sides:
+        return
+    try:
+        sender = env.body().body_command_sender
+    except Exception as e:
+        print(f"[server] cannot reach body_command_sender for passive arms: {e}")
+        return
+    for s in sides:
+        sl = PASSIVE_ARM_SLICES.get(s)
+        if sl is None:
+            print(f"[server] G1_PASSIVE_ARMS: unknown side {s!r} (use 'left' / 'right')")
+            continue
+        sender.robot_kp[sl] = 0.0
+        sender.robot_kd[sl] = 0.0
+        print(f"[server] {s.upper()} arm set to PASSIVE (kp=0, kd=0) — "
+              f"arm will hang limp under gravity")
+
+
 def start_dex1_latch():
     if os.environ.get("G1_GRIPPER", "1") in ("0", "false", "False", ""):
         print("[server] dex1 gripper latch disabled (G1_GRIPPER=0)")
@@ -593,6 +630,7 @@ def main(config: ControlLoopConfig):
         config=wbc_config,
         wbc_version=config.wbc_version,
     )
+    apply_passive_arms(env)
     if env.sim and not config.sim_sync_mode:
         env.start_simulator()
 
