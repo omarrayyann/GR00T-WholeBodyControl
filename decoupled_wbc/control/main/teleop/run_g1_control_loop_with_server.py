@@ -123,7 +123,7 @@ class JpegTcpLatch:
                     try:
                         chunk = sock.recv(1 << 20)
                     except BlockingIOError:
-                        time.sleep(0.005)
+                        time.sleep(0.001)
                         continue
                     if not chunk:
                         break
@@ -432,7 +432,7 @@ def build_flask_app(wbc_policy, latest, cameras, dex1):
             while True:
                 jpeg, ts = cam.get_jpeg()
                 if jpeg is None or ts == last_sent_ts:
-                    time.sleep(0.005)
+                    time.sleep(0.001)
                     continue
                 last_sent_ts = ts
                 yield (
