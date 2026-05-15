@@ -444,7 +444,7 @@ def build_flask_app(wbc_policy, latest, cameras, dex1):
 
         return Response(
             gen(),
-            mimetype=b"multipart/x-mixed-replace; boundary=" + boundary,
+            mimetype="multipart/x-mixed-replace; boundary=" + boundary.decode(),
             headers={"X-Camera-Name": name},
         )
 
