@@ -30,9 +30,9 @@ RGB sources: JPEG-over-TCP from gst-launch tcpserversink instances on the G1.
   Set G1_CAMERAS="" or G1_CAMERA_HOST="" to disable.
 
 Passive arms (real-robot only — real arms hang limp under gravity):
-      G1_PASSIVE_ARMS=left          # left arm receives kp=kd=0
+      G1_PASSIVE_ARMS=left          # left arm receives kp=kd=0  (DEFAULT)
       G1_PASSIVE_ARMS=left,right    # both arms passive
-      G1_PASSIVE_ARMS=               # default: both arms actuated
+      G1_PASSIVE_ARMS=               # disable: both arms actuated
 
 Dex1 gripper:
   Talks to dex1_1_gripper_server over Unitree DDS topics
@@ -568,9 +568,13 @@ PASSIVE_ARM_SLICES = {"left": slice(15, 22), "right": slice(22, 29)}
 
 
 def apply_passive_arms(env):
-    """If G1_PASSIVE_ARMS is set, zero kp/kd of those arm motors so they hang
-    limp (real-robot only; sim has no effect)."""
-    spec = os.environ.get("G1_PASSIVE_ARMS", "")
+    """Zero kp/kd of the configured arm motors so they hang limp.
+    Default is G1_PASSIVE_ARMS=left because our setup only has the right
+    Dex1-1 gripper installed; the left arm should not actuate. Override:
+        G1_PASSIVE_ARMS=        (empty: both arms actuated)
+        G1_PASSIVE_ARMS=right   (only right arm passive)
+        G1_PASSIVE_ARMS=left,right (both passive)"""
+    spec = os.environ.get("G1_PASSIVE_ARMS", "left")
     sides = [s.strip().lower() for s in spec.split(",") if s.strip()]
     if not sides:
         return

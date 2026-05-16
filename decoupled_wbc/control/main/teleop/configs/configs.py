@@ -105,8 +105,12 @@ class BaseConfig(ArgsConfigTemplate):
     enable_waist: bool = False
     """Whether to include waist joints in IK."""
 
-    with_hands: bool = True
-    """Enable hand functionality. When False, robot operates without hands."""
+    with_hands: bool = False
+    """Enable Dex3 hand functionality (init + calibration). When False, robot
+    operates without the Dex3 three-finger hands. Default is False since our
+    setup uses Dex1-1 grippers (handled separately via the dex1_1_gripper_server
+    + Dex1Latch in run_g1_control_loop_with_server.py), not Dex3. Set to True
+    via --with-hands if you reinstall Dex3 hands."""
 
     high_elbow_pose: bool = False
     """Enable high elbow pose configuration for default joint positions."""
