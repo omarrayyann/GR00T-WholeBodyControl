@@ -34,6 +34,14 @@ Passive arms (real-robot only — real arms hang limp under gravity):
       G1_PASSIVE_ARMS=left,right    # both arms passive
       G1_PASSIVE_ARMS=               # disable: both arms actuated
 
+G1 service bootstrap (on by default):
+  At startup the server SSHes to the G1 and starts dex1_1_gripper_server
+  + both gst-launch camera publishers if not already running. Configure:
+      G1_BOOTSTRAP=0          disable auto-startup
+      G1_SSH_HOST=192.168.123.164
+      G1_SSH_USER=unitree
+      G1_SSH_PASSWORD=123
+
 Dex1 gripper:
   Talks to dex1_1_gripper_server over Unitree DDS topics
   rt/dex1/{right,left}/{cmd,state}. Configure with:
@@ -558,6 +566,101 @@ def start_camera_latches():
             for name, host, port in entries}
 
 
+G1_SSH_HOST = "192.168.123.164"
+G1_SSH_USER = "unitree"
+G1_SSH_PASSWORD = "123"
+DEX1_SERVER_BIN = "/home/unitree/dex1_1_service/bin/dex1_1_gripper_server"
+
+
+def bootstrap_g1_services():
+    """SSH into the G1 and ensure dex1_1_gripper_server + the two gst camera
+    publishers (head_camera @ 5000, wrist_camera @ 5001) are running. Idempotent:
+    if a service is already up, leave it alone. Disable with G1_BOOTSTRAP=0."""
+    if os.environ.get("G1_BOOTSTRAP", "1") in ("0", "false", "False", ""):
+        print("[server][bootstrap] disabled (G1_BOOTSTRAP=0)")
+        return
+    try:
+        import paramiko
+    except ImportError:
+        print("[server][bootstrap] paramiko not installed, skipping G1 bootstrap")
+        return
+    host = os.environ.get("G1_SSH_HOST", G1_SSH_HOST)
+    user = os.environ.get("G1_SSH_USER", G1_SSH_USER)
+    pw = os.environ.get("G1_SSH_PASSWORD", G1_SSH_PASSWORD)
+
+    try:
+        c = paramiko.SSHClient()
+        c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        c.connect(host, username=user, password=pw, timeout=10)
+    except Exception as e:
+        print(f"[server][bootstrap] SSH to {host} failed: {e} — skipping")
+        return
+
+    def run(cmd, timeout=10):
+        _, out, _ = c.exec_command(cmd, timeout=timeout)
+        return out.read().decode().strip()
+
+    # 1. dex1_1_gripper_server (needs sudo for serial port + RT scheduling)
+    if not run("pgrep -f dex1_1_gripper_server | head -1"):
+        print(f"[server][bootstrap] starting dex1_1_gripper_server on {host}")
+        run(f"echo {pw} | sudo -S -p '' rm -f /home/{user}/dex1.log")
+        run(
+            f"echo {pw} | sudo -S -p '' sh -c "
+            f"'nohup {DEX1_SERVER_BIN} --network eth0 "
+            f"> /home/{user}/dex1.log 2>&1 </dev/null &'"
+        )
+        time.sleep(3)
+        if run("pgrep -f dex1_1_gripper_server | head -1"):
+            print("[server][bootstrap]   dex1 server OK")
+        else:
+            print(f"[server][bootstrap]   dex1 server failed — check "
+                  f"/home/{user}/dex1.log on the G1")
+    else:
+        print("[server][bootstrap] dex1_1_gripper_server already running")
+
+    # 2. find an MJPEG-capable v4l device for each camera and start gst
+    devs = {}
+    listing = run(
+        "for v in /dev/video*; do n=$(basename $v); "
+        "printf '%s\\t%s\\n' \"$v\" "
+        "\"$(cat /sys/class/video4linux/$n/name 2>/dev/null)\"; done"
+    )
+    for line in listing.splitlines():
+        if "\t" not in line:
+            continue
+        path, name = line.split("\t", 1)
+        if "H264" in name and "fisheye" not in devs:
+            devs.setdefault("fisheye", path)
+        elif "Innomaker" in name and "innomaker" not in devs:
+            devs.setdefault("innomaker", path)
+
+    def ensure_gst(label, dev, port):
+        if run(f"ss -tlnp 2>/dev/null | grep ':{port}'"):
+            print(f"[server][bootstrap] {label} :{port} already up")
+            return
+        cmd = (
+            f"nohup gst-launch-1.0 -q "
+            f"v4l2src device={dev} do-timestamp=true ! "
+            f"image/jpeg,width=1280,height=720,framerate=30/1 ! "
+            f"queue max-size-buffers=1 leaky=downstream ! "
+            f"tcpserversink host=0.0.0.0 port={port} sync=false async=false "
+            f"  recover-policy=latest sync-method=latest-keyframe units-max=2 buffers-max=2 "
+            f"> /tmp/gst{port}.log 2>&1 </dev/null & disown"
+        )
+        c.exec_command(cmd, get_pty=False, timeout=8)
+        time.sleep(2)
+        if run(f"ss -tlnp 2>/dev/null | grep ':{port}'"):
+            print(f"[server][bootstrap] {label} :{port} ({dev}) OK")
+        else:
+            print(f"[server][bootstrap] {label} :{port} ({dev}) FAILED")
+
+    if "fisheye" in devs:
+        ensure_gst("head_camera (fisheye)", devs["fisheye"], 5000)
+    if "innomaker" in devs:
+        ensure_gst("wrist_camera (innomaker)", devs["innomaker"], 5001)
+    c.close()
+
+
 # Body motor index layout (29 actuators):
 #   0..5   left leg
 #   6..11  right leg
@@ -610,6 +713,8 @@ def start_dex1_latch():
 
 
 def main(config: ControlLoopConfig):
+    bootstrap_g1_services()
+
     ros_manager = ROSManager(node_name=CONTROL_NODE_NAME)
     node = ros_manager.node
 
