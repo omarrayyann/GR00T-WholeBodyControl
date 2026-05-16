@@ -290,10 +290,15 @@ class G1SupplementalInfo(RobotSupplementalInfo):
                 "wrist_pitch": {"left": -0.2, "right": -0.2},
             }
         else:  # ElbowPose.LOW
-            # All-zero default upper-body pose. Upstream had shoulder_roll
-            # offset to ±0.2 rad as anti-bind padding; for our fork we want
-            # the policy to settle to exactly q=0 on every upper-body joint.
-            default_joint_q = {}
+            # Right-arm home pose customized for our setup: shoulder pitched
+            # forward + shoulder rolled in + elbow bent so the right arm
+            # holds a useful manipulation posture. Left arm runs passive
+            # (G1_PASSIVE_ARMS=left), so its defaults don't matter.
+            default_joint_q = {
+                "shoulder_pitch": {"right": 0.2},
+                "shoulder_roll": {"right": -0.2},
+                "elbow_pitch": {"right": -0.2},
+            }
 
         teleop_upper_body_motion_scale = 1.0
 
