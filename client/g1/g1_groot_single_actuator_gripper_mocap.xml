@@ -1,0 +1,10 @@
+<mujoco model="g1_groot_single_actuator_gripper_scene">
+  <include file="../../../../GR00T-WholeBodyControl/decoupled_wbc/sim2mujoco/resources/robots/g1/g1_gear_wbc_with_grippers.xml"/>
+
+  <worldbody>
+    <body name="right_hand_target" mocap="true" pos="0.45 -0.25 0.95" quat="1 0 0 0">
+      <geom name="right_hand_target_geom" type="sphere" size="0.03" rgba="0.95 0.2 0.2 0.65" contype="0" conaffinity="0"/>
+      <site name="right_hand_target_site" size="0.012" rgba="1 0 0 1"/>
+    </body>
+  </worldbody>
+</mujoco>

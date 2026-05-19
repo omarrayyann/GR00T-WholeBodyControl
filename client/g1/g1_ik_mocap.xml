@@ -1,0 +1,11 @@
+<mujoco model="g1_ik_mocap_scene">
+  <include file="g1_ik.xml"/>
+
+  <worldbody>
+    <geom name="floor" type="plane" size="0 0 1" rgba="0.95 0.95 0.95 1"/>
+    <body name="right_hand_target" mocap="true" pos="0.45 -0.25 0.95" quat="1 0 0 0">
+      <geom name="right_hand_target_geom" type="sphere" size="0.03" rgba="0.95 0.2 0.2 0.65" contype="0" conaffinity="0"/>
+      <site name="right_hand_target_site" size="0.012" rgba="1 0 0 1"/>
+    </body>
+  </worldbody>
+</mujoco>
