@@ -635,9 +635,21 @@ def bootstrap_g1_services():
             devs.setdefault("innomaker", path)
 
     def ensure_gst(label, dev, port):
-        if run(f"ss -tlnp 2>/dev/null | grep ':{port}'"):
-            print(f"[server][bootstrap] {label} :{port} already up")
+        # Check if there's already a gst-launch on this port *and* it points at
+        # the currently-expected device. /dev/videoN numbering shifts on
+        # replug, so a stale gst can be "listening" but reading from a
+        # device that no longer exists -> zero frames.
+        existing = run(
+            f"pgrep -af 'gst-launch.*port={port}\\b' | grep -v pgrep | head -1"
+        )
+        if existing and f"device={dev} " in existing:
+            print(f"[server][bootstrap] {label} :{port} already up (matches {dev})")
             return
+        if existing:
+            print(f"[server][bootstrap] {label} :{port} stale "
+                  f"(bound to wrong /dev/video), restarting on {dev}")
+            run(f"pkill -9 -f 'gst-launch.*port={port}\\b'")
+            time.sleep(1.5)
         cmd = (
             f"nohup gst-launch-1.0 -q "
             f"v4l2src device={dev} do-timestamp=true ! "
@@ -652,7 +664,8 @@ def bootstrap_g1_services():
         if run(f"ss -tlnp 2>/dev/null | grep ':{port}'"):
             print(f"[server][bootstrap] {label} :{port} ({dev}) OK")
         else:
-            print(f"[server][bootstrap] {label} :{port} ({dev}) FAILED")
+            print(f"[server][bootstrap] {label} :{port} ({dev}) FAILED — "
+                  f"check /tmp/gst{port}.log on G1")
 
     if "fisheye" in devs:
         ensure_gst("head_camera (fisheye)", devs["fisheye"], 5000)
